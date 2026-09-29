@@ -1,0 +1,8 @@
+services:
+  pdf-grouper:
+    build: .
+    image: rlk-pdf-grouper:latest
+    container_name: rlk-pdf-grouper
+    ports:
+      - "8090:80"
+    restart: unless-stopped

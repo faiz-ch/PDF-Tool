@@ -1,0 +1,6 @@
+node_modules
+dist
+public/gs/gs.js
+public/gs/gs.wasm
+.git
+*.log
