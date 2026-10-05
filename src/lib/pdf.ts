@@ -1,6 +1,7 @@
 import { PDFDocument, degrees } from 'pdf-lib';
 import * as pdfjs from 'pdfjs-dist/legacy/build/pdf.mjs';
 import { PDFJS_WORKER } from './pdfjs-worker';
+import { pdfjsResources } from './pdfjs-options';
 import type { PageItem, Rotation, Source } from './types';
 
 pdfjs.GlobalWorkerOptions.workerSrc = `${import.meta.env.BASE_URL}${PDFJS_WORKER}`;
@@ -47,21 +48,14 @@ export function isSupported(file: File) {
   return file.type === 'application/pdf' || /\.pdf$/i.test(file.name) || file.type.startsWith('image/');
 }
 
+/** Reads a file (images are converted to a one-page PDF). Page count is filled in by the renderer. */
 export async function fileToSource(file: File): Promise<Source> {
   const isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(file.name);
   const bytes = isPdf ? new Uint8Array(await file.arrayBuffer()) : await imageToPdf(file);
-  let doc: PDFDocument;
-  try {
-    doc = await PDFDocument.load(bytes, { ignoreEncryption: false });
-  } catch (e) {
-    const msg = String((e as Error).message || e);
-    if (/encrypt/i.test(msg)) throw new Error(`"${file.name}" is password-protected. Please remove the password first.`);
-    throw new Error(`"${file.name}" could not be read as a PDF.`);
-  }
-  return { id: uid(), name: file.name, bytes, pageCount: doc.getPageCount() };
+  return { id: uid(), name: file.name, bytes, pageCount: 0 };
 }
 
-/* ---------- Rendering (pdf.js) ---------- */
+/* ---------- On-screen rendering (fallback when background rendering is unavailable) ---------- */
 
 const viewerDocs = new Map<string, pdfjs.PDFDocumentLoadingTask>();
 
@@ -69,42 +63,54 @@ function getViewerDoc(source: Source) {
   let task = viewerDocs.get(source.id);
   if (!task) {
     // pdf.js takes ownership of the buffer, so give it a copy.
-    task = pdfjs.getDocument({ data: source.bytes.slice() });
+    task = pdfjs.getDocument({ data: source.bytes.slice(), ...pdfjsResources(window.location.origin) });
     viewerDocs.set(source.id, task);
+    task.promise.catch(() => viewerDocs.delete(source.id));
   }
   return task.promise;
 }
 
-export function forgetSource(sourceId: string) {
+export function forgetMainThreadDoc(sourceId: string) {
   viewerDocs.get(sourceId)?.destroy();
   viewerDocs.delete(sourceId);
+}
+
+/** Releases everything held for a file. */
+export function forgetEditDoc(sourceId: string) {
   editDocs.delete(sourceId);
 }
 
-/** Renders a page to a JPEG object URL, `targetWidth` pixels wide. */
-export function renderPage(source: Source, pageIndex: number, targetWidth: number) {
-  return Promise.race([
-    renderPageInner(source, pageIndex, targetWidth),
-    new Promise<never>((_, rej) =>
-      setTimeout(() => rej(new Error('Page rendering timed out. The rendering engine may not have loaded.')), 20_000),
-    ),
-  ]);
+export async function openOnMainThread(source: Source) {
+  const doc = await getViewerDoc(source);
+  const aspects: number[] = [];
+  for (let i = 1; i <= doc.numPages; i++) {
+    const v = (await doc.getPage(i)).getViewport({ scale: 1 });
+    aspects.push(v.height / v.width);
+  }
+  const meta = await doc.getMetadata();
+  const encrypted = !!(meta.info as { EncryptFilterName?: string | null })?.EncryptFilterName;
+  return { pageCount: doc.numPages, aspects, encrypted };
 }
 
-async function renderPageInner(source: Source, pageIndex: number, targetWidth: number) {
+/** Renders a page to a JPEG, `targetWidth` pixels wide. */
+export async function renderOnMainThread(source: Source, pageIndex: number, targetWidth: number, quality = 0.85) {
   const doc = await getViewerDoc(source);
   const page = await doc.getPage(pageIndex + 1);
-  const base = page.getViewport({ scale: 1 });
-  const viewport = page.getViewport({ scale: targetWidth / base.width });
-  const canvas = document.createElement('canvas');
-  canvas.width = Math.ceil(viewport.width);
-  canvas.height = Math.ceil(viewport.height);
-  await page.render({ canvas, canvasContext: canvas.getContext('2d')!, viewport }).promise;
-  const blob: Blob = await new Promise((res, rej) =>
-    canvas.toBlob((b) => (b ? res(b) : rej(new Error('Render failed'))), 'image/jpeg', 0.85),
-  );
-  page.cleanup();
-  return { url: URL.createObjectURL(blob), aspect: base.height / base.width };
+  try {
+    const base = page.getViewport({ scale: 1 });
+    const viewport = page.getViewport({ scale: targetWidth / base.width });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.ceil(viewport.width);
+    canvas.height = Math.ceil(viewport.height);
+    await page.render({ canvas, canvasContext: canvas.getContext('2d')!, viewport }).promise;
+    const blob: Blob = await new Promise((res, rej) =>
+      canvas.toBlob((b) => (b ? res(b) : rej(new Error('Render failed'))), 'image/jpeg', quality),
+    );
+    canvas.width = canvas.height = 0;
+    return { blob, aspect: base.height / base.width };
+  } finally {
+    page.cleanup();
+  }
 }
 
 /* ---------- Building group PDFs (pdf-lib) ---------- */

@@ -10,13 +10,17 @@ interface Props {
   onClick?: (e: React.MouseEvent) => void;
   actions?: ReactNode;
   size?: 'md' | 'sm';
+  /** Lets the page list know when this card is on screen, so it is drawn first. */
+  cardRef?: (el: HTMLDivElement | null) => void;
 }
 
 /** Square thumbnail box so rotated pages always fit without layout jumps. */
-export default function Thumb({ page, label, selected, dimmed, badge, onClick, actions, size = 'md' }: Props) {
+export default function Thumb({ page, label, selected, dimmed, badge, onClick, actions, size = 'md', cardRef }: Props) {
   const box = size === 'md' ? 'h-40' : 'h-28';
   return (
     <div
+      ref={cardRef}
+      data-page-id={page.id}
       onClick={onClick}
       className={`group relative select-none rounded-lg border bg-white p-2 shadow-sm transition ${
         onClick ? 'cursor-pointer' : ''
@@ -32,6 +36,7 @@ export default function Thumb({ page, label, selected, dimmed, badge, onClick, a
             src={page.thumb}
             alt={label}
             draggable={false}
+            decoding="async"
             className="max-h-full max-w-full object-contain shadow transition-transform"
             style={{ transform: `rotate(${page.rotation}deg)`, maxHeight: page.rotation % 180 ? '70%' : '100%' }}
           />

@@ -4,12 +4,12 @@ import { PreviewModal } from './components/Modal';
 import GroupEditor from './components/GroupEditor';
 import LimitSelect from './components/LimitSelect';
 import ResultsModal from './components/ResultsModal';
-import { buildPdf, fileToSource, forgetSource, formatBytes, isSupported, nextRotation, renderPage, uid } from './lib/pdf';
+import { buildPdf, fileToSource, forgetEditDoc, formatBytes, isSupported, nextRotation, uid } from './lib/pdf';
+import { PRIORITY, isCancelled, previews, renderer, type RenderJob } from './lib/renderer';
 import { fileNamesFor, generateGroup, resolveLimitBytes } from './lib/generate';
 import type { Group, GroupResult, LimitSetting, PageItem, Source } from './lib/types';
 
 const THUMB_WIDTH = 260;
-const RENDER_CONCURRENCY = 3;
 
 export default function App() {
   const [sources, setSources] = useState<Source[]>([]);
@@ -31,8 +31,7 @@ export default function App() {
   const [rangeMode, setRangeMode] = useState(false);
   const [groupsOpen, setGroupsOpen] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
-  const rendering = useRef(new Set<string>());
-  const [renderTick, setRenderTick] = useState(0);
+  const mainRef = useRef<HTMLElement>(null);
 
   const sourceMap = useMemo(() => new Map(sources.map((s) => [s.id, s])), [sources]);
   const pageMap = useMemo(() => new Map(pool.map((p) => [p.id, p])), [pool]);
@@ -59,13 +58,19 @@ export default function App() {
       setLoading((n) => n + 1);
       try {
         const src = await fileToSource(file);
+        const info = await renderer.open(src);
+        if (info.encrypted) {
+          renderer.close(src.id);
+          throw new Error(`"${file.name}" is password-protected. Please remove the password first.`);
+        }
+        src.pageCount = info.pageCount;
         const items: PageItem[] = Array.from({ length: src.pageCount }, (_, i) => ({
           id: uid(),
           sourceId: src.id,
           sourceName: src.name,
           pageIndex: i,
           rotation: 0,
-          aspect: 1.414,
+          aspect: info.aspects[i] ?? 1.414,
         }));
         setSources((s) => [...s, src]);
         setPool((p) => [...p, ...items]);
@@ -77,36 +82,102 @@ export default function App() {
     }
   }, []);
 
-  /* ---------- Thumbnail rendering queue ---------- */
+  /* ---------- Thumbnails: background rendering, pages on screen first ---------- */
 
+  const jobs = useRef(new Map<string, RenderJob>());
+  const visible = useRef(new Set<string>());
+  const observer = useRef<IntersectionObserver | null>(null);
+  const observed = useRef(new Map<string, HTMLElement>());
+  const thumbRefs = useRef(new Map<string, (el: HTMLElement | null) => void>());
+  const finished = useRef(new Map<string, { thumb?: string; aspect?: number; thumbError?: boolean }>());
+  const flushScheduled = useRef(false);
+
+  // Finished thumbnails are applied together once per frame, instead of redrawing the list per page.
+  const flushThumbs = useCallback(() => {
+    flushScheduled.current = false;
+    const done = new Map(finished.current);
+    finished.current.clear();
+    if (done.size === 0) return;
+    setPool((ps) => {
+      const live = new Set(ps.map((x) => x.id));
+      done.forEach((d, id) => !live.has(id) && d.thumb && URL.revokeObjectURL(d.thumb));
+      return ps.map((x) => (done.has(x.id) ? { ...x, ...done.get(x.id) } : x));
+    });
+  }, []);
+
+  const finish = useCallback(
+    (id: string, d: { thumb?: string; aspect?: number; thumbError?: boolean }) => {
+      finished.current.set(id, d);
+      if (!flushScheduled.current) {
+        flushScheduled.current = true;
+        requestAnimationFrame(flushThumbs);
+      }
+    },
+    [flushThumbs],
+  );
+
+  // Watches which thumbnails are on screen (plus a margin) and moves them to the front of the queue.
   useEffect(() => {
-    const waiting = pool.filter((p) => !p.thumb && !p.thumbError && !rendering.current.has(p.id));
-    const slots = RENDER_CONCURRENCY - rendering.current.size;
-    for (const page of waiting.slice(0, Math.max(0, slots))) {
-      const src = sourceMap.get(page.sourceId);
+    const io = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          const id = (e.target as HTMLElement).dataset.pageId;
+          if (!id) continue;
+          if (e.isIntersecting) visible.current.add(id);
+          else visible.current.delete(id);
+          jobs.current.get(id)?.setPriority(e.isIntersecting ? PRIORITY.VISIBLE : PRIORITY.BACKGROUND);
+        }
+      },
+      { root: mainRef.current, rootMargin: '200px 0px' },
+    );
+    observer.current = io;
+    observed.current.forEach((el) => io.observe(el));
+    return () => io.disconnect();
+  }, []);
+
+  /** Stable ref callback per page, so React does not re-attach observers on every update. */
+  const thumbRef = useCallback((id: string) => {
+    let fn = thumbRefs.current.get(id);
+    if (!fn) {
+      fn = (el: HTMLElement | null) => {
+        const prev = observed.current.get(id);
+        if (prev && prev !== el) {
+          observer.current?.unobserve(prev);
+          observed.current.delete(id);
+        }
+        if (el) {
+          observed.current.set(id, el);
+          observer.current?.observe(el);
+        }
+      };
+      thumbRefs.current.set(id, fn);
+    }
+    return fn;
+  }, []);
+
+  // Every page without a thumbnail is queued once; on-screen pages are promoted by the observer.
+  useEffect(() => {
+    for (const p of pool) {
+      if (p.thumb || p.thumbError || jobs.current.has(p.id)) continue;
+      const src = sourceMap.get(p.sourceId);
       if (!src) continue;
-      rendering.current.add(page.id);
-      renderPage(src, page.pageIndex, THUMB_WIDTH)
-        .then(({ url, aspect }) =>
-          setPool((ps) => {
-            if (!ps.some((x) => x.id === page.id)) {
-              URL.revokeObjectURL(url);
-              return ps;
-            }
-            return ps.map((x) => (x.id === page.id ? { ...x, thumb: url, aspect } : x));
-          }),
-        )
+      const job = renderer.request(
+        src,
+        p.pageIndex,
+        THUMB_WIDTH,
+        visible.current.has(p.id) ? PRIORITY.VISIBLE : PRIORITY.BACKGROUND,
+      );
+      jobs.current.set(p.id, job);
+      job.promise
+        .then(({ url, aspect }) => finish(p.id, { thumb: url, aspect }))
         .catch((err) => {
+          if (isCancelled(err)) return;
           console.error('Thumbnail render failed', err);
-          setPool((ps) => ps.map((x) => (x.id === page.id ? { ...x, thumbError: true } : x)));
+          finish(p.id, { thumbError: true });
           setRenderError(String((err as Error).message || err));
-        })
-        .finally(() => {
-          rendering.current.delete(page.id);
-          setRenderTick((t) => t + 1);
         });
     }
-  }, [pool, sourceMap, renderTick]);
+  }, [pool, sourceMap, finish]);
 
   /* ---------- Selection ---------- */
 
@@ -224,7 +295,14 @@ export default function App() {
   const startOver = () => {
     if (!confirm('Remove all files and groups and start again?')) return;
     pool.forEach((p) => p.thumb?.startsWith('blob:') && URL.revokeObjectURL(p.thumb));
-    sources.forEach((s) => forgetSource(s.id));
+    jobs.current.forEach((j) => j.cancel());
+    jobs.current.clear();
+    visible.current.clear();
+    previews.clear();
+    sources.forEach((s) => {
+      renderer.close(s.id);
+      forgetEditDoc(s.id);
+    });
     setSources([]);
     setPool([]);
     setGroups([]);
@@ -335,7 +413,7 @@ export default function App() {
 
       <div className="flex min-h-0 flex-1">
         {/* Page pool */}
-        <main className="relative min-w-0 flex-1 overflow-y-auto p-3 sm:p-5">
+        <main ref={mainRef} className="relative min-w-0 flex-1 overflow-y-auto p-3 sm:p-5">
           {pool.length === 0 && loading === 0 ? (
             <button
               onClick={() => fileInput.current?.click()}
@@ -383,6 +461,7 @@ export default function App() {
                     <Thumb
                       key={p.id}
                       page={p}
+                      cardRef={thumbRef(p.id)}
                       label={pageLabel(p)}
                       selected={selected.has(p.id)}
                       onClick={(e) => onPageClick(i, e)}

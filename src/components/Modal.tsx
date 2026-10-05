@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import { renderPage } from '../lib/pdf';
+import { PRIORITY, isCancelled, previews } from '../lib/renderer';
 import type { PageItem, Source } from '../lib/types';
 
 export function Modal({
@@ -58,28 +58,33 @@ export function PreviewModal({
   onClose: () => void;
 }) {
   const page = list[index];
-  const [url, setUrl] = useState<string | null>(null);
+  const src = page ? sources.get(page.sourceId) : undefined;
+  const [url, setUrl] = useState<string | null>(() => (src && page ? previews.cached(src, page.pageIndex) : null));
   const [error, setError] = useState<string | null>(null);
 
+  // Drop queued full-size renders when the preview closes; finished pages stay cached.
+  useEffect(() => () => previews.cancelPending(), []);
+
   useEffect(() => {
-    let cancelled = false;
-    let made: string | null = null;
-    setUrl(null);
+    if (!page || !src) return;
+    let current = true;
     setError(null);
-    const src = page && sources.get(page.sourceId);
-    if (src)
-      renderPage(src, page.pageIndex, 1400)
-        .then((r) => {
-          made = r.url;
-          if (!cancelled) setUrl(r.url);
-          else URL.revokeObjectURL(r.url);
-        })
-        .catch((e) => !cancelled && setError(String((e as Error).message || e)));
+    setUrl(previews.cached(src, page.pageIndex));
+    previews.focus(src, page.pageIndex);
+    previews
+      .get(src, page.pageIndex, PRIORITY.PREVIEW)
+      .then((u) => current && setUrl(u))
+      .catch((e) => current && !isCancelled(e) && setError(String((e as Error).message || e)));
+    // Fetch the neighbours ahead of time, so Next / Previous open instantly.
+    for (const j of [index + 1, index - 1, index + 2]) {
+      const n = list[j];
+      const ns = n && sources.get(n.sourceId);
+      if (ns) previews.get(ns, n.pageIndex, PRIORITY.PREFETCH);
+    }
     return () => {
-      cancelled = true;
-      if (made) URL.revokeObjectURL(made);
+      current = false;
     };
-  }, [page, sources]);
+  }, [page, src, index, list, sources]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -116,21 +121,32 @@ export function PreviewModal({
       }
     >
       <div className="flex h-[calc(100dvh-8.5rem)] items-center justify-center overflow-hidden bg-slate-100 sm:h-[72vh]">
-        {url ? (
-          <img
-            src={url}
-            alt="Page preview"
-            className="object-contain shadow-lg"
-            style={{
-              transform: `rotate(${page.rotation}deg)`,
-              maxHeight: sideways ? 'min(72vw, 94vw)' : '100%',
-              maxWidth: sideways ? '72vh' : '100%',
-            }}
-          />
-        ) : error ? (
+        {error && !url ? (
           <div className="max-w-lg text-center text-red-700">
             <div className="font-semibold">This page could not be displayed.</div>
             <div className="mt-1 text-sm">{error}</div>
+          </div>
+        ) : url || page.thumb ? (
+          <div className="relative flex h-full w-full items-center justify-center">
+            <img
+              // Shows the thumbnail enlarged at once, then swaps to the sharp page when ready.
+              src={url ?? page.thumb}
+              alt="Page preview"
+              data-sharp={url ? 'true' : 'false'}
+              decoding="async"
+              className={`object-contain shadow-lg ${url ? '' : 'blur-[1px]'}`}
+              style={{
+                transform: `rotate(${page.rotation}deg)`,
+                height: url ? undefined : '100%',
+                maxHeight: sideways ? 'min(72vw, 94vw)' : '100%',
+                maxWidth: sideways ? '72vh' : '100%',
+              }}
+            />
+            {!url && (
+              <div className="absolute bottom-3 rounded-full bg-slate-900/75 px-3 py-1 text-xs font-medium text-white">
+                Loading full quality…
+              </div>
+            )}
           </div>
         ) : (
           <div className="text-slate-500">Rendering…</div>
